@@ -20,7 +20,7 @@ def es_path(explicit):
     if explicit:
         candidate = Path(explicit)
         return str(candidate.resolve()) if candidate.is_file() else None
-    candidates = [explicit, os.getenv("EVERYTHING_ES_PATH"),
+    candidates = [os.getenv("EVERYTHING_ES_PATH"),
                   str(Path(__file__).resolve().parents[1] / "bin" / "es.exe"),
                   shutil.which("es.exe")]
     return next((str(Path(p).resolve()) for p in candidates if p and Path(p).is_file()), None)
@@ -35,7 +35,7 @@ def metadata(path):
     p = Path(path)
     try:
         info = p.stat()
-        is_dir = p.is_dir()
+        is_dir = stat.S_ISDIR(info.st_mode)
         return {"path": str(p.absolute()), "name": p.name,
                 "type": "directory" if is_dir else "file",
                 "size_bytes": info.st_size if not is_dir else None,
@@ -61,6 +61,8 @@ def query_for(args):
     if args.name:
         # Quote the PCRE pattern as a query term; hex-escape literal quotes.
         pattern = re.escape(args.name).replace('"', r'\x22')
+        if args.exact:
+            pattern = "^" + pattern + "$"
         terms.append('regex:"' + pattern + '"')
     kind = selected_kind(args)
     if kind != "any":
@@ -83,14 +85,15 @@ def query_for(args):
 def everything(args, executable):
     with tempfile.TemporaryDirectory(prefix="everything-search-") as temp:
         output = Path(temp) / "results.efu"
-        command = [executable, "-argv", "-timeout", str(int(args.timeout * 1000)),
+        wait = min(args.timeout, args.es_timeout)
+        command = [executable, "-argv", "-timeout", str(max(1, int(wait * 1000))),
                    "-n", str(args.limit + 1), "-sort", "date-modified-descending",
                    "-export-efu", str(output)]
         if args.instance:
             command += ["-instance", args.instance]
         # -search reparses embedded quotes; -- preserves the query with -argv.
         command += ["--", query_for(args)]
-        result = subprocess.run(command, capture_output=True, timeout=args.timeout + 3)
+        result = subprocess.run(command, capture_output=True, timeout=wait + 1)
         if result.returncode:
             message = (result.stderr or result.stdout).decode("utf-8", errors="replace").strip()
             raise RuntimeError("ES exit " + str(result.returncode) + ": " + message)
@@ -157,6 +160,11 @@ def default_roots():
 
 
 def scan(args):
+    if args.timeout <= 0:
+        return {"backend": "scan", "scope": args.root or [], "has_more": False,
+                "partial": True, "results": [],
+                "warnings": ["Search budget exhausted before directory scan; no directories scanned"]}
+    deadline = time.monotonic() + args.timeout
     roots = list(dict.fromkeys(str(Path(p).resolve()) for p in (args.root or default_roots())))
     stack = []
     warnings = []
@@ -164,7 +172,8 @@ def scan(args):
         if not Path(root).is_dir():
             raise ValueError("Search root is not an accessible directory: " + root)
         stack.append(root)
-    deadline = time.monotonic() + args.timeout
+    # The first requested root has priority; stack.pop() otherwise reverses it.
+    stack.reverse()
     results = []
     seen = set()
     skipped = 0
@@ -187,20 +196,24 @@ def scan(args):
                     try:
                         is_dir = entry.is_dir()
                         # Junctions/symlinks are not traversed to avoid cycles and scope escapes.
-                        reparse = bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
-                                       & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
-                        if is_dir and not entry.is_symlink() and not reparse:
-                            stack.append(entry.path)
+                        if is_dir and not entry.is_symlink():
+                            reparse = bool(getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+                                           & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+                            if not reparse:
+                                stack.append(entry.path)
                         kind = selected_kind(args)
-                        if kind == "file" and is_dir or kind == "directory" and not is_dir:
+                        if (kind == "file" and is_dir) or (kind == "directory" and not is_dir):
                             continue
-                        if args.name and args.name.casefold() not in entry.name.casefold():
-                            continue
+                        if args.name:
+                            name, wanted = entry.name.casefold(), args.name.casefold()
+                            if (args.exact and name != wanted) or (not args.exact and wanted not in name):
+                                continue
                         if args.ext and (is_dir or Path(entry.name).suffix.lstrip(".").casefold() not in args.ext):
                             continue
-                        modified = dt.datetime.fromtimestamp(entry.stat().st_mtime).date()
-                        if args.after and modified < args.after or args.before and modified >= args.before:
-                            continue
+                        if args.after or args.before:
+                            modified = dt.datetime.fromtimestamp(entry.stat().st_mtime).date()
+                            if (args.after and modified < args.after) or (args.before and modified >= args.before):
+                                continue
                         results.append(metadata(entry.path))
                         if len(results) > args.limit:
                             break
@@ -226,6 +239,7 @@ def scan(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", help="Literal filename substring (not wildcard or regex)")
+    parser.add_argument("--exact", action="store_true", help="Match the entire --name, case-insensitive")
     parser.add_argument("--query", help="Advanced Everything query; requires Everything")
     parser.add_argument("--root", action="append", help="Directory scope; repeat for several roots")
     parser.add_argument("--ext", action="append", default=[], help="Extension without dot; repeat")
@@ -234,7 +248,8 @@ def main():
     parser.add_argument("--after", type=date, help="Modified on/after YYYY-MM-DD")
     parser.add_argument("--before", type=date, help="Modified before YYYY-MM-DD")
     parser.add_argument("--limit", type=int, default=30)
-    parser.add_argument("--timeout", type=float, default=15)
+    parser.add_argument("--timeout", type=float, default=15, help="Shared search budget in seconds (default 15)")
+    parser.add_argument("--es-timeout", type=float, default=3, help="ES wait budget, capped by --timeout (default 3)")
     parser.add_argument("--backend", choices=["auto", "everything", "scan"], default="auto")
     parser.add_argument("--es-path")
     parser.add_argument("--instance", help="Everything named instance")
@@ -242,6 +257,10 @@ def main():
     args = parser.parse_args()
     if args.limit < 1 or args.limit > 1000 or not 0 < args.timeout <= 120:
         parser.error("limit must be 1..1000; timeout must be greater than 0 and at most 120")
+    if not 0 < args.es_timeout <= 120:
+        parser.error("es-timeout must be greater than 0 and at most 120")
+    if args.exact and not args.name:
+        parser.error("--exact requires --name")
     args.ext = [ext.lstrip(".").casefold() for ext in args.ext]
     if any(not re.fullmatch(r"[\w-]+", ext) for ext in args.ext):
         parser.error("Invalid extension")
@@ -297,6 +316,7 @@ def main():
     if args.query and args.backend == "scan":
         parser.error("--query cannot be interpreted by the scan backend")
     warning = None
+    started = time.monotonic()
     if args.backend != "scan":
         try:
             if not executable:
@@ -306,16 +326,18 @@ def main():
             output = everything(args, executable)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
             if args.backend == "everything" or args.query or args.instance:
-                raise RuntimeError(str(exc) + "; advanced query/instance requires a working Everything search client") from exc
+                raise RuntimeError(str(exc) + "; directory fallback disabled for this request") from exc
             warning = str(exc)
             if "ES exit 8:" in warning:
                 warning += "; Error 8 can mean that the IPC window was unavailable or the database did not become ready before -timeout"
+            args.timeout = max(0, args.timeout - (time.monotonic() - started))
             output = scan(args)
     else:
         output = scan(args)
     if warning:
         output["warnings"].insert(0, "Everything unavailable; searched directories instead: " + warning)
     output["returned"] = len(output["results"])
+    output["elapsed_ms"] = round((time.monotonic() - started) * 1000)
     print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
@@ -328,4 +350,3 @@ if __name__ == "__main__":
     except (OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
-

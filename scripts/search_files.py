@@ -1,6 +1,7 @@
 """Read-only file locator: Everything ES first, bounded directory scan otherwise."""
 import argparse
 import csv
+import ctypes
 import datetime as dt
 import json
 import os
@@ -12,26 +13,40 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 
 def es_path(explicit):
+    if explicit:
+        candidate = Path(explicit)
+        return str(candidate.resolve()) if candidate.is_file() else None
     candidates = [explicit, os.getenv("EVERYTHING_ES_PATH"),
                   str(Path(__file__).resolve().parents[1] / "bin" / "es.exe"),
                   shutil.which("es.exe")]
     return next((str(Path(p).resolve()) for p in candidates if p and Path(p).is_file()), None)
 
 
+def selected_kind(args):
+    # Advanced Everything syntax owns its filters unless --kind was explicit.
+    return args.kind if args.kind else ("any" if args.query else "file")
+
+
 def metadata(path):
     p = Path(path)
     try:
-        stat = p.stat()
+        info = p.stat()
+        is_dir = p.is_dir()
         return {"path": str(p.absolute()), "name": p.name,
-                "type": "directory" if p.is_dir() else "file",
-                "size_bytes": stat.st_size if p.is_file() else None,
-                "modified": dt.datetime.fromtimestamp(stat.st_mtime).astimezone().isoformat(),
-                "exists": True}
-    except OSError:
-        return {"path": str(p.absolute()), "name": p.name, "exists": False}
+                "type": "directory" if is_dir else "file",
+                "size_bytes": info.st_size if not is_dir else None,
+                "modified": dt.datetime.fromtimestamp(info.st_mtime).astimezone().isoformat(),
+                "exists": True, "status": "available"}
+    except (FileNotFoundError, NotADirectoryError):
+        return {"path": str(p.absolute()), "name": p.name, "exists": False,
+                "status": "missing"}
+    except OSError as exc:
+        return {"path": str(p.absolute()), "name": p.name, "exists": None,
+                "status": "inaccessible", "access_error": str(exc)}
 
 
 def date(value):
@@ -47,8 +62,9 @@ def query_for(args):
         # Quote the PCRE pattern as a query term; hex-escape literal quotes.
         pattern = re.escape(args.name).replace('"', r'\x22')
         terms.append('regex:"' + pattern + '"')
-    if args.kind != "any":
-        terms.append("file:" if args.kind == "file" else "folder:")
+    kind = selected_kind(args)
+    if kind != "any":
+        terms.append("file:" if kind == "file" else "folder:")
     if args.ext:
         terms.append("ext:" + ";".join(args.ext))
     if args.after:
@@ -84,16 +100,60 @@ def everything(args, executable):
             rows = list(csv.DictReader(stream))
         if rows and "Filename" not in rows[0]:
             raise RuntimeError("Unexpected EFU columns")
+        records = [metadata(r["Filename"]) for r in rows[:args.limit]]
+        inaccessible = sum(item.get("status") == "inaccessible" for item in records)
+        warnings = ([str(inaccessible) + " matched paths could not be checked for access"]
+                    if inaccessible else [])
         return {"backend": "everything", "scope": args.root or ["Everything indexed locations"],
                 "query": query_for(args), "has_more": len(rows) > args.limit,
-                "partial": False, "results": [metadata(r["Filename"]) for r in rows[:args.limit]],
-                "warnings": []}
+                "partial": inaccessible > 0, "results": records, "warnings": warnings}
 
 
 def default_roots():
-    home = Path.home()
-    return [str(p) for p in [Path.cwd(), home / "Desktop", home / "Documents", home / "Downloads"]
-            if p.is_dir()]
+    paths = [Path.cwd()]
+    if sys.platform == "win32":
+        # Resolve shell Known Folders so OneDrive and manually redirected folders work.
+        folders = {
+            "Desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
+            "Documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
+            "Downloads": "374DE290-123F-4565-9164-39C4925E467B",
+        }
+        for folder_id in folders.values():
+            try:
+                guid = (ctypes.c_ubyte * 16).from_buffer_copy(uuid.UUID(folder_id).bytes_le)
+                path_ptr = ctypes.c_void_p()
+                shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+                shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                                         ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+                shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+                result = shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                                      ctypes.byref(path_ptr))
+                if result == 0 and path_ptr.value:
+                    try:
+                        paths.append(Path(ctypes.wstring_at(path_ptr.value)))
+                    finally:
+                        ole32 = ctypes.WinDLL("ole32")
+                        ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+                        ole32.CoTaskMemFree.restype = None
+                        ole32.CoTaskMemFree(path_ptr)
+            except (AttributeError, OSError, ValueError):
+                continue
+    else:
+        home = Path.home()
+        paths.extend([home / "Desktop", home / "Documents", home / "Downloads"])
+    roots = []
+    seen = set()
+    for path in paths:
+        try:
+            if path.is_dir():
+                root = str(path.resolve())
+                key = os.path.normcase(root)
+                if key not in seen:
+                    seen.add(key)
+                    roots.append(root)
+        except OSError:
+            continue
+    return roots
 
 
 def scan(args):
@@ -131,7 +191,8 @@ def scan(args):
                                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
                         if is_dir and not entry.is_symlink() and not reparse:
                             stack.append(entry.path)
-                        if args.kind == "file" and is_dir or args.kind == "directory" and not is_dir:
+                        kind = selected_kind(args)
+                        if kind == "file" and is_dir or kind == "directory" and not is_dir:
                             continue
                         if args.name and args.name.casefold() not in entry.name.casefold():
                             continue
@@ -153,9 +214,13 @@ def scan(args):
         warnings.append("Time limit reached; search is incomplete")
     if skipped:
         warnings.append(str(skipped) + " inaccessible entries/directories skipped")
+    selected = results[:args.limit]
+    inaccessible = sum(item.get("status") == "inaccessible" for item in selected)
+    if inaccessible:
+        warnings.append(str(inaccessible) + " matched paths could not be checked for access")
     return {"backend": "scan", "scope": roots, "has_more": len(results) > args.limit,
-            "partial": timed_out or skipped > 0,
-            "results": results[:args.limit], "warnings": warnings}
+            "partial": timed_out or skipped > 0 or inaccessible > 0,
+            "results": selected, "warnings": warnings}
 
 
 def main():
@@ -164,7 +229,8 @@ def main():
     parser.add_argument("--query", help="Advanced Everything query; requires Everything")
     parser.add_argument("--root", action="append", help="Directory scope; repeat for several roots")
     parser.add_argument("--ext", action="append", default=[], help="Extension without dot; repeat")
-    parser.add_argument("--kind", choices=["file", "directory", "any"], default="file")
+    parser.add_argument("--kind", choices=["file", "directory", "any"],
+                        help="Result type; name searches default to file, raw queries keep their own filters")
     parser.add_argument("--after", type=date, help="Modified on/after YYYY-MM-DD")
     parser.add_argument("--before", type=date, help="Modified before YYYY-MM-DD")
     parser.add_argument("--limit", type=int, default=30)
@@ -187,15 +253,43 @@ def main():
                 parser.error("Search root is not an accessible directory: " + root)
     executable = es_path(args.es_path)
     if args.diagnose:
-        diagnosis = {"es_path": executable, "platform": sys.platform}
+        diagnosis = {"es_path": executable, "platform": sys.platform,
+                     "instance": args.instance or "default"}
         if executable:
+            command = [executable]
+            if args.instance:
+                command += ["-instance", args.instance]
             try:
-                result = subprocess.run([executable, "-get-everything-version"],
+                version_result = subprocess.run(command + ["-get-everything-version"],
                                         capture_output=True, timeout=5)
-                diagnosis.update({"ipc_available": result.returncode == 0,
-                                  "probe": (result.stdout + result.stderr).decode("utf-8", errors="replace").strip()})
+                version_text = (version_result.stdout + version_result.stderr).decode(
+                    "utf-8", errors="replace").strip()
+                diagnosis["everything_version"] = version_text
             except (OSError, subprocess.TimeoutExpired) as exc:
-                diagnosis.update({"ipc_available": False, "probe": str(exc)})
+                diagnosis["everything_version"] = None
+                diagnosis["version_probe"] = str(exc)
+            try:
+                search_probe = [*command, "-argv", "-timeout", "5000", "-n", "1", "--",
+                                "__everything_file_search_readiness_probe__"]
+                probe_result = subprocess.run(search_probe, capture_output=True, timeout=8)
+                probe_text = (probe_result.stdout + probe_result.stderr).decode(
+                    "utf-8", errors="replace").strip()
+                diagnosis.update({"search_available": probe_result.returncode == 0,
+                                  "ipc_available": probe_result.returncode == 0,
+                                  "search_probe": probe_text or "exit " + str(probe_result.returncode)})
+                if probe_result.returncode == 8:
+                    diagnosis["hint"] = (
+                        "Search IPC is unavailable or the Everything database did not become ready "
+                        "within the 5-second probe timeout")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                diagnosis.update({"search_available": False, "ipc_available": False,
+                                  "search_probe": str(exc)})
+        else:
+            message = ("Specified --es-path does not exist or is not a file: " + args.es_path
+                       if args.es_path else "es.exe not found")
+            diagnosis.update({"everything_version": None, "search_available": False,
+                              "ipc_available": False, "version_probe": message,
+                              "search_probe": message})
         print(json.dumps(diagnosis, ensure_ascii=False, indent=2))
         return
     if not any([args.name, args.query, args.ext, args.after, args.before]):
@@ -206,12 +300,16 @@ def main():
     if args.backend != "scan":
         try:
             if not executable:
+                if args.es_path:
+                    raise RuntimeError("Specified --es-path does not exist or is not a file: " + args.es_path)
                 raise RuntimeError("es.exe not found")
             output = everything(args, executable)
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
             if args.backend == "everything" or args.query or args.instance:
-                raise RuntimeError(str(exc) + "; advanced query/instance requires accessible Everything IPC") from exc
+                raise RuntimeError(str(exc) + "; advanced query/instance requires a working Everything search client") from exc
             warning = str(exc)
+            if "ES exit 8:" in warning:
+                warning += "; Error 8 can mean that the IPC window was unavailable or the database did not become ready before -timeout"
             output = scan(args)
     else:
         output = scan(args)
@@ -230,3 +328,4 @@ if __name__ == "__main__":
     except (OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)
+

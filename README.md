@@ -9,9 +9,10 @@
 - 按文件名、扩展名、文件夹和修改日期查找。
 - 使用 Everything 索引搜索跨磁盘文件，避免每次遍历磁盘。
 - 返回完整路径、文件大小、修改时间和是否仍然存在。
-- Everything 不可用时，自动使用有时间限制的目录搜索。
+- Everything 暂时不可用时，诊断连接后使用一次有时间限制的目录搜索。
 - 支持中文路径、带空格路径，以及多个搜索目录。
 - 显示搜索范围、结果截断和未完成搜索的提示。
+- 识别 Windows 重定向的桌面、文档和下载目录，并区分文件缺失与无权访问。
 
 搜索脚本只定位文件。后续操作由 agent 根据用户请求和当前文件权限执行。
 
@@ -113,6 +114,9 @@ python ./scripts/search_files.py --name '讲义' --root 'D:\学习资料' --back
 # 高级 Everything 查询。
 python ./scripts/search_files.py --query 'file: 报价 ext:xlsx;xls' --backend everything
 
+# 文件夹查询保留原查询里的 folder:，不会被默认 file: 覆盖。
+python ./scripts/search_files.py --query 'folder: 项目' --backend everything
+
 # 检查 ES 路径及 Everything 连接情况。
 python ./scripts/search_files.py --diagnose
 ```
@@ -124,7 +128,7 @@ python ./scripts/search_files.py --diagnose
 | `--name` | 文件名的字面子串，不是通配符或正则表达式 |
 | `--root` | 搜索目录；可重复指定 |
 | `--ext` | 扩展名，例如 `xlsx`；可重复指定 |
-| `--kind` | `file`、`directory` 或 `any`，默认 `file` |
+| `--kind` | `file`、`directory` 或 `any`；文件名搜索默认 `file`，高级查询默认保留自身筛选 |
 | `--after` | 修改日期的起点，包含当天，格式为 `YYYY-MM-DD` |
 | `--before` | 修改日期的终点，不包含当天 |
 | `--limit` | 最大返回数量，默认 30，范围 1–1000 |
@@ -155,7 +159,8 @@ python ./scripts/search_files.py --diagnose
       "type": "file",
       "size_bytes": 14280,
       "modified": "2026-09-23T14:30:00+08:00",
-      "exists": true
+      "exists": true,
+      "status": "available"
     }
   ],
   "warnings": [],
@@ -169,22 +174,23 @@ python ./scripts/search_files.py --diagnose
 - `partial`：因时间限制或无法访问某些目录，搜索未完整完成。
 - `warnings`：降级原因、搜索超时或跳过目录等信息。
 - `exists`：返回信息时能否访问该路径；操作前仍需重新确认。
+- `status`：`available` 表示当前可访问，`missing` 表示路径已不存在，`inaccessible` 表示无法检查；后者的 `exists` 为 `null`。
 
 ## 搜索范围与常见问题
 
 ### 没有 Everything，能用吗？
 
-可以。`auto` 模式会改用目录搜索，`scan` 模式可以直接使用。未指定 `--root` 时，备用搜索范围是当前目录，以及存在的用户桌面、文档和下载目录。它不会默认扫描所有磁盘。
+可以。`auto` 模式在一次 Everything 查询失败后会改用目录搜索，`scan` 模式可以直接使用。未指定 `--root` 时，备用搜索范围是当前目录，以及 Windows 实际桌面、文档和下载目录（包括重定向位置）。它不会默认扫描所有磁盘。
 
 ### 明明安装了 Everything，为什么连接失败？
 
-先运行 `--diagnose`。Error 8 表示 ES 没有连接到 Everything IPC，可能涉及程序未运行、命名实例、进程权限或沙箱隔离。它并不能单独证明 Everything 未安装。
+运行 `--diagnose` 可分别查看 Everything 版本和一次 5 秒搜索探测，并检查 `--instance` 指定的实例。版本探测成功不保证数据库已就绪或搜索可用。Error 8 通常表示找不到 IPC 窗口；配合 `-timeout` 时，也可能是数据库未能在时限内就绪。它不能单独证明 Everything 未安装或沙箱隔离。
 
-在 agent 沙箱隔离 IPC 的环境中，可能需要允许该只读查询在沙箱外执行。应遵循当前环境的权限流程。
+如果 `auto` 已返回目录搜索结果，不要重新扫描相同范围。当前工具提供合规的只读沙箱外执行流程时，可对原查询再试一次 `--backend everything`，成功后合并去重；不要自行提权或更改 Everything 设置。普通找文件的请求在找到足够辨认的候选后即可停止；只有用户要求完整清单才继续跨盘搜索。
 
 ### 返回零结果，表示文件不存在吗？
 
-只能说明当前搜索范围和条件下没有返回匹配。Everything 只覆盖已配置的索引位置；备用搜索可能有目录范围、访问权限或时间限制。需要时调整关键词、扩大指定目录或检查索引配置。
+只能说明当前搜索范围和条件下没有返回匹配。查看 `partial` 和 `warnings`：搜索超时或跳过无权访问的目录时，结果不完整。路径信息里的 `exists: null` 表示无法检查，不等于不存在。Everything 只覆盖已配置的索引位置；需要时调整关键词、扩大指定目录或检查索引配置。
 
 ### 能按文件内容搜索吗？
 
@@ -214,3 +220,4 @@ python ./scripts/search_files.py --diagnose
 - [OpenAI 技能说明](https://developers.openai.com/plugins/concepts/skills)
 
 `es.exe` 是 voidtools 提供的第三方工具，随附的 MIT 许可见 [bin/LICENSE-ES.txt](bin/LICENSE-ES.txt)。该许可适用于 ES，与本项目编写的技能说明及脚本分别适用。
+

@@ -6,10 +6,10 @@
 
 ## 功能
 
-- 按文件名、扩展名、文件夹和修改日期查找。
+- 按文件名、扩展名、文件夹和修改日期查找，支持完整文件名精确匹配。
 - 使用 Everything 索引搜索跨磁盘文件，避免每次遍历磁盘。
 - 返回完整路径、文件大小、修改时间和是否仍然存在。
-- Everything 暂时不可用时，诊断连接后使用一次有时间限制的目录搜索。
+- agent 优先快速查询索引，连接失败时最多重试一次，再做有限目录搜索。
 - 支持中文路径、带空格路径，以及多个搜索目录。
 - 显示搜索范围、结果截断和未完成搜索的提示。
 - 识别 Windows 重定向的桌面、文档和下载目录，并区分文件缺失与无权访问。
@@ -61,7 +61,8 @@ everything-file-search/
 │   ├── es.exe
 │   └── LICENSE-ES.txt
 └── scripts/
-    └── search_files.py
+    ├── search_files.py
+    └── test_search_files.py
 ```
 
 如需快速跨盘搜索，从 [Everything 官方下载页](https://www.voidtools.com/downloads/) 安装 Everything 并启动。`es.exe` 是独立命令行工具，需要配合运行中的 Everything 使用。
@@ -70,20 +71,20 @@ everything-file-search/
 
 ## 在 agent 中使用
 
-在聊天中指定技能和目标：
+在聊天中描述要找的文件：
 
 ```text
-使用 $everything-file-search 帮我找黑马程序员的学习资料。
+帮我找黑马程序员的学习资料。
 ```
 
 也可以给出更具体的条件：
 
 ```text
-使用 $everything-file-search 找到 D 盘资料目录里上个月修改过的 Excel 报价表。
+找到 D 盘资料目录里上个月修改过的 Excel 报价表。
 ```
 
 ```text
-使用 $everything-file-search 找到项目的 README，读取它并总结启动步骤。
+找到项目的 README，读取它并总结启动步骤。
 ```
 
 当文件名相同且无法明确判断目标时，技能会指导 agent 展示候选路径。明确目标后，再执行相应操作。
@@ -92,9 +93,12 @@ everything-file-search/
 
 下面的命令在技能目录中运行：
 
-```powershell
+```bash
 # 按文件名查找，默认只返回文件。
 python ./scripts/search_files.py --name '报价'
+
+# agent 定位完整文件名：仅查索引，避免失败后提前扫描目录。
+python ./scripts/search_files.py --name '学习目标.xlsx' --exact --backend everything --timeout 5
 
 # 在指定目录中查找 Excel 文件。
 python ./scripts/search_files.py --name '报价' --ext xlsx --root 'D:\资料'
@@ -126,20 +130,22 @@ python ./scripts/search_files.py --diagnose
 | 参数 | 说明 |
 | --- | --- |
 | `--name` | 文件名的字面子串，不是通配符或正则表达式 |
+| `--exact` | 与 `--name` 配合，匹配完整文件名，不区分大小写 |
 | `--root` | 搜索目录；可重复指定 |
 | `--ext` | 扩展名，例如 `xlsx`；可重复指定 |
 | `--kind` | `file`、`directory` 或 `any`；文件名搜索默认 `file`，高级查询默认保留自身筛选 |
 | `--after` | 修改日期的起点，包含当天，格式为 `YYYY-MM-DD` |
 | `--before` | 修改日期的终点，不包含当天 |
 | `--limit` | 最大返回数量，默认 30，范围 1–1000 |
-| `--timeout` | ES 等待或备用搜索时间预算，默认 15 秒，最大 120 秒 |
+| `--timeout` | 索引查询与自动回退共用的搜索预算，默认 15 秒，最大 120 秒 |
+| `--es-timeout` | 索引等待预算，默认 3 秒，受 `--timeout` 限制 |
 | `--backend` | `auto`、`everything` 或 `scan`，默认 `auto` |
 | `--query` | 高级 Everything 查询，不会自动降级为目录搜索 |
 | `--es-path` | 指定 ES 可执行文件位置 |
 | `--instance` | 指定 Everything 命名实例，不能降级为目录搜索 |
 | `--diagnose` | 输出 ES 路径和连接诊断结果 |
 
-时间预算用于限制等待和搜索；进程启动或系统文件访问可能带来额外耗时。
+ES 子进程额外允许 1 秒退出余量；自动回退会扣除索引查询已消耗的时间。目录扫描在文件系统调用之间检查期限，单次系统调用阻塞可能超时，因此不是严格墙钟上限。工具审批、启动和诊断耗时不计入搜索预算。
 
 ### 返回结果
 
@@ -169,6 +175,7 @@ python ./scripts/search_files.py --diagnose
 ```
 
 - `backend`：实际采用的搜索方式。
+- `elapsed_ms`：脚本搜索阶段耗时（毫秒），不包含工具审批和脚本启动。
 - `scope`：此次搜索覆盖的位置。
 - `has_more`：匹配数量超过返回上限，应收窄条件或提高上限。
 - `partial`：因时间限制或无法访问某些目录，搜索未完整完成。
@@ -186,7 +193,9 @@ python ./scripts/search_files.py --diagnose
 
 运行 `--diagnose` 可分别查看 Everything 版本和一次 5 秒搜索探测，并检查 `--instance` 指定的实例。版本探测成功不保证数据库已就绪或搜索可用。Error 8 通常表示找不到 IPC 窗口；配合 `-timeout` 时，也可能是数据库未能在时限内就绪。它不能单独证明 Everything 未安装或沙箱隔离。
 
-如果 `auto` 已返回目录搜索结果，不要重新扫描相同范围。当前工具提供合规的只读沙箱外执行流程时，可对原查询再试一次 `--backend everything`，成功后合并去重；不要自行提权或更改 Everything 设置。普通找文件的请求在找到足够辨认的候选后即可停止；只有用户要求完整清单才继续跨盘搜索。
+agent 优先用 `--backend everything --timeout 5`；连接失败且工具支持合规的只读沙箱外执行时，对原查询最多重试一次。之后才用 `--backend scan --root '<目录>' --timeout 10` 搜索最可能的目录；不并行启动大范围扫描。若已使用 `auto` 并返回目录结果，不再重复扫描相同范围。不要自行提权或更改 Everything 设置。
+
+找到足以辨认的候选后立即报告路径。`exists: true`、`status: available` 已经经过文件检查，单纯定位不必再次检查；修改文件前仍需确认。只有用户要求完整清单才继续扩展搜索。成功零结果不属于连接故障，应先检查关键词与索引范围。
 
 ### 返回零结果，表示文件不存在吗？
 
@@ -201,6 +210,14 @@ python ./scripts/search_files.py --diagnose
 搜索脚本不会修改或删除目标文件。后续操作由 agent 按用户明确请求执行，并受当前会话权限限制。目录链接和 junction 不会被备用搜索递归遍历。
 
 ## 验证情况
+
+离线回归测试（无需安装 Everything）：
+
+```bash
+python ./scripts/test_search_files.py
+```
+
+覆盖精确匹配、中文及特殊字符、共用时间预算、索引成功零结果不回退、索引专用模式失败不扫描等行为。
 
 在 Windows 环境中，使用 Everything 1.4.1.1026 和 ES 1.1.0.38 验证了：
 
@@ -217,7 +234,5 @@ python ./scripts/search_files.py --diagnose
 - [Everything 下载](https://www.voidtools.com/downloads/)
 - [ES 命令行说明](https://www.voidtools.com/support/everything/command_line_interface/)
 - [ES 官方源代码](https://github.com/voidtools/ES)
-- [OpenAI 技能说明](https://developers.openai.com/plugins/concepts/skills)
 
 `es.exe` 是 voidtools 提供的第三方工具，随附的 MIT 许可见 [bin/LICENSE-ES.txt](bin/LICENSE-ES.txt)。该许可适用于 ES，与本项目编写的技能说明及脚本分别适用。
-

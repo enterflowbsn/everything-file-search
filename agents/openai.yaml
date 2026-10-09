@@ -1,0 +1,4 @@
+interface:
+  display_name: "Everything 文件搜索"
+  short_description: "快速定位电脑文件，获取完整路径后操作；没有 Everything 时使用目录搜索"
+  default_prompt: "使用 $everything-file-search 查找我描述的文件，并根据完整路径完成后续操作。"
